@@ -1,0 +1,9 @@
+POST http://localhost:5002/api/enquiries
+Content-Type: application/json
+
+{
+  "name": "Test User",
+  "email": "test@example.com",
+  "phone": "0400000000",
+  "message": "Hello from REST Client!"
+}
