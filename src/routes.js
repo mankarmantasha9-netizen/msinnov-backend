@@ -65,17 +65,18 @@ router.post("/enquiries", async (req, res) => {
 
     res.status(201).json({ ok: true, enquiry: result.rows[0] });
   } catch (err) {
-    console.error(err);
+    console.error("Error in /enquiries:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 // ------------------------------
 // Book an Appointment + Google Calendar Event
+// FIXED to match your DB columns: date/time (no start_time/end_time)
 // ------------------------------
 router.post("/appointments", async (req, res) => {
   try {
-    const { name, email, phone, date, time, notes } = req.body;
+    const { name, email, phone, date, time, notes, durationMinutes } = req.body;
 
     if (!name || !email || !date || !time) {
       return res.status(400).json({
@@ -83,23 +84,28 @@ router.post("/appointments", async (req, res) => {
       });
     }
 
-    // Duration (minutes) – from env if set, otherwise 30
-    const DURATION_MINUTES = Number(process.env.MEETING_DURATION_MINUTES || 30);
+    // Duration (minutes) – request body overrides env, otherwise env, otherwise 30
+    const DURATION_MINUTES = Number(
+      durationMinutes || process.env.MEETING_DURATION_MINUTES || 30
+    );
 
-    // Combine date + time into a Date object (Sydney offset)
-    // Expecting: date = '2025-12-30', time = '14:00'
+    // Build start/end for Calendar (Sydney offset)
+    // Expecting: date = '2026-01-10', time = '10:00'
     const startLocal = new Date(`${date}T${time}:00+11:00`);
     const endLocal = new Date(startLocal.getTime() + DURATION_MINUTES * 60 * 1000);
 
     const startISO = startLocal.toISOString();
     const endISO = endLocal.toISOString();
 
-    // Check for conflicts in our own DB (basic overlap check)
+    // ✅ Optional simple conflict check using your existing DB fields (date + time)
+    // This prevents exact duplicate slots (not full overlap logic, but safe + simple)
     const conflictCheck = await pool.query(
       `SELECT id FROM appointments
        WHERE status <> 'cancelled'
-         AND tstzrange(start_time, end_time) && tstzrange($1::timestamptz, $2::timestamptz)`,
-      [startISO, endISO]
+         AND date = $1
+         AND time = $2
+       LIMIT 1`,
+      [date, time]
     );
 
     if (conflictCheck.rows.length > 0) {
@@ -108,23 +114,27 @@ router.post("/appointments", async (req, res) => {
       });
     }
 
-    // Save appointment as 'pending'
+    // ✅ Insert using ONLY columns that exist in your appointments table
     const result = await pool.query(
-      `INSERT INTO appointments
-       (name, email, phone, notes, start_time, end_time, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+      `INSERT INTO appointments (name, email, phone, date, time, notes, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [name.trim(), email.trim(), phone?.trim() || null, notes || null, startISO, endISO]
+      [
+        name.trim(),
+        email.trim(),
+        phone?.trim() || null,
+        date,
+        time,
+        notes || null,
+        "pending",
+      ]
     );
 
     const appointment = result.rows[0];
 
     // ------------------------------
-    // ✅ Create Google Calendar event
+    // ✅ Create Google Calendar event (does NOT touch DB columns)
     // ------------------------------
-    // IMPORTANT: This requires that you have already done OAuth once and
-    // google_tokens.json exists.
-    // If tokens are missing, we do NOT fail the booking; we just log the issue.
     let calendarEvent = null;
     try {
       calendarEvent = await createCalendarEvent({
@@ -140,7 +150,11 @@ router.post("/appointments", async (req, res) => {
         endISO,
       });
     } catch (calErr) {
-      console.error("Google Calendar event creation failed:", calErr?.message || calErr);
+      console.error(
+        "Google Calendar event creation failed:",
+        calErr?.response?.data || calErr?.message || calErr
+      );
+      // We do NOT fail the booking if calendar fails
     }
 
     // ------------------------------
@@ -194,11 +208,20 @@ router.post("/appointments", async (req, res) => {
       console.error("Appointment email failed:", emailErr.message);
     }
 
-    // Include event info in response (helpful for debugging)
-    res.status(201).json({ ok: true, appointment, calendarEvent });
+    // Helpful debugging response
+    res.status(201).json({
+      ok: true,
+      appointment,
+      calendarEvent,
+      computed: { startISO, endISO, durationMinutes: DURATION_MINUTES },
+    });
   } catch (err) {
     console.error("Error in /appointments:", err);
-    res.status(500).json({ error: "Server error" });
+    // Return real error message temporarily to debug faster
+    res.status(500).json({
+      error: "Server error",
+      details: err?.message || String(err),
+    });
   }
 });
 
